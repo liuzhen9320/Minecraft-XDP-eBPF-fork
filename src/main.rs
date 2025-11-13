@@ -89,7 +89,7 @@ fn start_shutdown_hook(arc: Arc<AtomicBool>, condvar: Arc<Condvar>) {
     let mut signals = Signals::new(TERM_SIGNALS).expect("Couldn't register signals");
     thread::spawn(move || {
         for signal in signals.forever() {
-            info!("Received termination signal: {signal}");
+            warn!("Received termination signal: {signal}");
             shutdown(arc, condvar);
             break; // Stop on first termination signal
         }
@@ -268,25 +268,24 @@ fn statistics_display(
         // Only display if there's activity (at least one packet dropped)
         if packets_per_sec > 0 {
             info!("┌─────────────────────────────────────────────────────────────────────────────────────────┐");
-            info!("│ Per-Second Statistics:                                                                  │");
+            info!("│ Per-Second Statistics                                                                   │");
             info!("├─────────────────────────────────────────────────────────────────────────────────────────┤");
-            info!("│  Total Packets Dropped:        {:>10} pkt/s                                          │", common::format_rate(packets_per_sec));
-            info!("│  Total Bytes Dropped:          {:>15}                                               │", common::format_bytes(bytes_per_sec));
-            info!("│  SYN Packets Dropped:          {:>10} pkt/s  (Connection attempts)                  │", common::format_rate(syn_per_sec));
-            info!("│  TCP Bypass Dropped:           {:>10} pkt/s  (SYN-ACK/URG attacks)                  │", common::format_rate(tcp_bypass_per_sec));
-            info!("│  Invalid Packets Dropped:      {:>10} pkt/s  (Malformed packets)                    │", common::format_rate(invalid_per_sec));
-            info!("│  Throttled Packets:            {:>10} pkt/s  (Rate limited)                         │", common::format_rate(throttled_per_sec));
-            info!("│  Blocked IP Packets:           {:>10} pkt/s  (From banned IPs)                      │", common::format_rate(blocked_ip_per_sec));
+            info!("│  Total Packets/Bytes Dropped:  {:>10} pkt/s {:>15}             ", common::format_rate(packets_per_sec), common::format_bytes(bytes_per_sec));
+            info!("│  SYN Packets Dropped:          {:>10} pkt/s  (Connection attempts)   ", common::format_rate(syn_per_sec));
+            info!("│  TCP Bypass Dropped:           {:>10} pkt/s  (SYN-ACK/URG attacks)   ", common::format_rate(tcp_bypass_per_sec));
+            info!("│  Invalid Packets Dropped:      {:>10} pkt/s  (Malformed packets)     ", common::format_rate(invalid_per_sec));
+            info!("│  Throttled Packets:            {:>10} pkt/s  (Rate limited)          ", common::format_rate(throttled_per_sec));
+            info!("│  Blocked IP Packets:           {:>10} pkt/s  (From banned IPs)       ", common::format_rate(blocked_ip_per_sec));
             info!("├─────────────────────────────────────────────────────────────────────────────────────────┤");
-            info!("│ Cumulative Totals:                                                                      │");
+            info!("│ Cumulative Totals                                                                       │");
             info!("├─────────────────────────────────────────────────────────────────────────────────────────┤");
-            info!("│  Total Packets:                {:>10}                                                  │", common::format_rate(current_stats.packets_dropped));
-            info!("│  Total Bytes:                  {:>15}                                               │", common::format_bytes(current_stats.bytes_dropped));
-            info!("│  Total SYN:                    {:>10}                                                  │", common::format_rate(current_stats.syn_packets_dropped));
-            info!("│  Total TCP Bypass:             {:>10}                                                  │", common::format_rate(current_stats.tcp_bypass_dropped));
-            info!("│  Total Invalid:                {:>10}                                                  │", common::format_rate(current_stats.invalid_packets_dropped));
-            info!("│  Total Throttled:              {:>10}                                                  │", common::format_rate(current_stats.throttled_packets_dropped));
-            info!("│  Total Blocked IP:             {:>10}                                                  │", common::format_rate(current_stats.blocked_ip_packets_dropped));
+            info!("│  Total Packets:                {:>10}   ", common::format_rate(current_stats.packets_dropped));
+            info!("│  Total Bytes:                  {:>15}   ", common::format_bytes(current_stats.bytes_dropped));
+            info!("│  Total SYN:                    {:>10}   ", common::format_rate(current_stats.syn_packets_dropped));
+            info!("│  Total TCP Bypass:             {:>10}   ", common::format_rate(current_stats.tcp_bypass_dropped));
+            info!("│  Total Invalid:                {:>10}   ", common::format_rate(current_stats.invalid_packets_dropped));
+            info!("│  Total Throttled:              {:>10}   ", common::format_rate(current_stats.throttled_packets_dropped));
+            info!("│  Total Blocked IP:             {:>10}   ", common::format_rate(current_stats.blocked_ip_packets_dropped));
             info!("└─────────────────────────────────────────────────────────────────────────────────────────┘");
             
             // Calculate and display percentage breakdown if there are drops
@@ -298,10 +297,10 @@ fn statistics_display(
                 let blocked_pct = (current_stats.blocked_ip_packets_dropped as f64 / current_stats.packets_dropped as f64) * 100.0;
                 
                 info!("┌─────────────────────────────────────────────────────────────────────────────────────────┐");
-                info!("│ Drop Reason Distribution:                                                               │");
+                info!("│ Drop Reason Distribution                                                                │");
                 info!("├─────────────────────────────────────────────────────────────────────────────────────────┤");
-                info!("│  SYN Floods:      {:>6.2}%  │  TCP Bypass: {:>6.2}%  │  Invalid: {:>6.2}%              │", syn_pct, bypass_pct, invalid_pct);
-                info!("│  Throttled:       {:>6.2}%  │  Blocked IP: {:>6.2}%                                     │", throttled_pct, blocked_pct);
+                info!("│  SYN Floods:      {:>6.2}%  │  TCP Bypass: {:>6.2}%  │  Invalid: {:>6.2}% ", syn_pct, bypass_pct, invalid_pct);
+                info!("│  Throttled:       {:>6.2}%  │  Blocked IP: {:>6.2}%                       ", throttled_pct, blocked_pct);
                 info!("└─────────────────────────────────────────────────────────────────────────────────────────┘");
             }
         }
@@ -321,7 +320,7 @@ fn statistics_display(
             .map_err(|e| anyhow::anyhow!("condvar wait_timeout poisoned: {}", e))?;
     }
     
-    info!("Statistics display thread shutting down");
+    debug!("Statistics display thread shutting down");
     Ok(())
 }
 
