@@ -4,6 +4,7 @@ use aya::{
     maps::{Array, HashMap, MapData},
     programs::{Xdp, XdpFlags},
 };
+use aya::programs::xdp::XdpLinkId;
 use common::{Ipv4FlowKey, Statistics};
 use env_logger::{Builder, Env};
 use libc::{CLOCK_BOOTTIME, clock_gettime, timespec};
@@ -72,14 +73,21 @@ fn main() {
 
     start_shutdown_hook(running.clone(), condvar.clone());
 
-    match load(args[1].as_str(), running.clone(), condvar.clone()) {
+    let xdp_data = match load(args[1].as_str(), running.clone(), condvar.clone()) {
+        Ok((ebpf, link)) => Some((ebpf, link)),
         Err(e) => {
             error!("Failed to load BPF program: {}", e);
+            None
         }
-        _ => {}
-    }
+    };
 
     shutdown(running, condvar);
+    
+    // Drop the Ebpf object and link to detach XDP program after shutdown
+    if let Some((_ebpf, link)) = xdp_data {
+        drop(link);
+        info!("XDP program detached successfully");
+    }
 
     info!("Good bye!");
 }
@@ -101,7 +109,7 @@ fn load(
     interface: &str,
     running: Arc<AtomicBool>,
     condvar: Arc<Condvar>,
-) -> Result<(), anyhow::Error> {
+) -> Result<(Ebpf, XdpLinkId), anyhow::Error> {
     // Load the compiled eBPF bytecode
     let data = include_bytes_aligned!(concat!(env!("CARGO_MANIFEST_DIR"), "/c/minecraft_filter.o"));
     info!("Loaded BPF program (size: {})", data.len());
@@ -204,7 +212,8 @@ fn load(
         .join()
         .map_err(|e| anyhow::anyhow!("clear-blocks thread panicked: {:?}", e))?;
 
-    Ok(())
+    // Return the Ebpf object and link so they can be kept alive and detached on shutdown
+    Ok((ebpf, result))
 }
 
 /// Spawns a thread to display real-time statistics every second
@@ -236,11 +245,6 @@ fn statistics_display(
     
     // Initialize previous statistics to zero for first iteration
     let mut prev_stats = Statistics::default();
-    
-    // Print header for statistics table
-    info!("╔═══════════════════════════════════════════════════════════════════════════════════════════════╗");
-    info!("║                            Real-time DDoS Protection Statistics                               ║");
-    info!("╚═══════════════════════════════════════════════════════════════════════════════════════════════╝");
     
     while running.load(Ordering::SeqCst) {
         let map = statistics_ref
