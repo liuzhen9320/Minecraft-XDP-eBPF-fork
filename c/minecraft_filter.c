@@ -32,6 +32,17 @@
 // Minecraft server port
 const __u16 ETH_IP_PROTO = __constant_htons(ETH_P_IP);
 
+// Statistics structure for monitoring dropped packets
+struct statistics {
+    __u64 packets_dropped;           // Total packets dropped
+    __u64 bytes_dropped;             // Total bytes dropped
+    __u64 syn_packets_dropped;       // SYN packets dropped
+    __u64 tcp_bypass_dropped;        // TCP bypass packets (SYN-ACK/URG)
+    __u64 invalid_packets_dropped;   // Invalid/malformed packets
+    __u64 throttled_packets_dropped; // Throttled packets
+    __u64 blocked_ip_packets_dropped;// Packets from blocked IPs
+};
+
 struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -67,6 +78,55 @@ struct
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } connection_throttle SEC(".maps");
 
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct statistics);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} statistics SEC(".maps");
+
+/*
+ * Helper function to update statistics counters
+ * @param packet_len: length of the dropped packet in bytes
+ * @param reason: bitmask indicating drop reason(s)
+ *   Bit 0 (1): SYN packet
+ *   Bit 1 (2): TCP bypass
+ *   Bit 2 (4): Invalid packet
+ *   Bit 3 (8): Throttled
+ *   Bit 4 (16): Blocked IP
+ */
+static __always_inline void update_stats(__u16 packet_len, __u8 reason)
+{
+    __u32 key = 0;
+    struct statistics *stats = bpf_map_lookup_elem(&statistics, &key);
+    if (!stats) {
+        return; // Should not happen, but safe guard
+    }
+    
+    // Update basic counters
+    __sync_fetch_and_add(&stats->packets_dropped, 1);
+    __sync_fetch_and_add(&stats->bytes_dropped, packet_len);
+    
+    // Update specific reason counters
+    if (reason & 1) {
+        __sync_fetch_and_add(&stats->syn_packets_dropped, 1);
+    }
+    if (reason & 2) {
+        __sync_fetch_and_add(&stats->tcp_bypass_dropped, 1);
+    }
+    if (reason & 4) {
+        __sync_fetch_and_add(&stats->invalid_packets_dropped, 1);
+    }
+    if (reason & 8) {
+        __sync_fetch_and_add(&stats->throttled_packets_dropped, 1);
+    }
+    if (reason & 16) {
+        __sync_fetch_and_add(&stats->blocked_ip_packets_dropped, 1);
+    }
+}
+
 static __always_inline __u8 detect_tcp_bypass(struct tcphdr *tcp)
 {
     if ((!tcp->syn && !tcp->ack && !tcp->fin && !tcp->rst) || // no SYN/ACK/FIN/RST flag
@@ -79,17 +139,20 @@ static __always_inline __u8 detect_tcp_bypass(struct tcphdr *tcp)
 }
 
 /*
- * Blocks the ip if of the connection and drops the packet
+ * Blocks the ip of the connection and drops the packet
  */
-static __always_inline __s32 block_and_drop(struct ipv4_flow_key *flow_key)
+static __always_inline __s32 block_and_drop(struct ipv4_flow_key *flow_key, __u16 packet_len, __u8 reason)
 {
     #if BLOCK_IPS
     __u64 now = bpf_ktime_get_ns();
     __u32 src_ip = flow_key->src_ip;
-    // here we use any as we want to punish as long as possible
     bpf_map_update_elem(&blocked_ips, &src_ip, &now, BPF_ANY);
     #endif
     bpf_map_delete_elem(&conntrack_map, flow_key);
+    
+    // Update statistics before dropping
+    update_stats(packet_len, reason | 4); // Mark as invalid packet
+    
     return XDP_DROP;
 }
 
@@ -110,9 +173,13 @@ static __always_inline __s32 update_state_or_drop(struct initial_state *initial_
 /*
  * Drops the current packet and removes the connection from the conntrack_map
  */
-static __always_inline __s32 drop_connection(struct ipv4_flow_key *flow_key)
+static __always_inline __s32 drop_connection(struct ipv4_flow_key *flow_key, __u16 packet_len, __u8 reason)
 {
     bpf_map_delete_elem(&conntrack_map, flow_key);
+    
+    // Update statistics
+    update_stats(packet_len, reason);
+    
     return XDP_DROP;
 }
 /*
@@ -129,6 +196,7 @@ static __always_inline __u32 switch_to_verified(struct ipv4_flow_key *flow_key)
     }
     return XDP_PASS;
 }
+
 #ifdef STATELESS
 static __u32 check_options(__u8 *opt_ptr, __u8 *opt_end, __u8 *packet_end)
 {
@@ -226,6 +294,9 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
+    // Calculate total packet length for statistics
+    __u16 packet_len = (__u16)(data_end - data);
+
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
     {
@@ -284,6 +355,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
     // Additional TCP bypass checks for abnormal flags
     if (detect_tcp_bypass(tcp))
     {
+        update_stats(packet_len, 2); // TCP bypass
         return XDP_DROP;
     }
 
@@ -297,6 +369,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
         __u64 *blocked = bpf_map_lookup_elem(&blocked_ips, &src_ip);
         if (blocked)
         {
+            update_stats(packet_len, 16 | 1); // Blocked IP + SYN
             return XDP_DROP;
         }
         #endif
@@ -310,6 +383,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 
         if (check_options(opt_ptr, opt_end, (void *)data_end) != 0) {
             // invalid options, drop the packet
+            update_stats(packet_len, 4 | 1); // Invalid + SYN
             return XDP_DROP;
         }
         #endif
@@ -317,12 +391,12 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 
         #if CONNECTION_THROTTLE
         // connection throttle
-        // 10 connection per ip per 3 seconds, otherwise drop
         __u32 *hit_counter = bpf_map_lookup_elem(&connection_throttle, &src_ip);
         if (hit_counter)
         {
             if (*hit_counter > HIT_COUNT)
             {
+                update_stats(packet_len, 8 | 1); // Throttled + SYN
                 return XDP_DROP;
             }
             (*hit_counter)++;
@@ -434,7 +508,7 @@ __s32 minecraft_filter(struct xdp_md *ctx)
             // fully drop legacy ping
             if (next_state == RECEIVED_LEGACY_PING)
             {
-                return drop_connection(&flow_key);
+                return drop_connection(&flow_key, packet_len, 4); // Invalid packet
             }
 
             initial_state->state = next_state;
@@ -483,11 +557,12 @@ __s32 minecraft_filter(struct xdp_md *ctx)
 
 // Using this labels drasticly reduce the file size
 block_and_drop:
-    return block_and_drop(&flow_key);
+    return block_and_drop(&flow_key, packet_len, 0);
 update_state_or_drop:
     return update_state_or_drop(initial_state, &flow_key);
 switch_to_verified:
     return switch_to_verified(&flow_key);
+
 }
 
 char _license[] SEC("license") = "Proprietary";
